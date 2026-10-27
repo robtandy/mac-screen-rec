@@ -111,21 +111,30 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     /// The real permission check: requesting shareable content is exactly
     /// what ScreenCaptureKit needs, so it can't disagree with System Settings
     /// the way CGPreflightScreenCaptureAccess sometimes does.
+    /// Races the shareable-content request against a timeout. Resumes exactly
+    /// once and never waits for the loser: the ObjC-bridged SCK call ignores
+    /// cancellation, so a structured task group would block until it ends.
     private static func fetchShareableContent(timeout: TimeInterval) async throws -> SCShareableContent {
-        try await withThrowingTaskGroup(of: SCShareableContent.self) { group in
-            group.addTask {
-                try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<SCShareableContent, Error>) in
+            let gate = OnceGate()
+            Task.detached {
+                do {
+                    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+                    if gate.claim() { continuation.resume(returning: content) }
+                } catch {
+                    if gate.claim() { continuation.resume(throwing: error) }
+                }
             }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                throw RecorderError.permissionRequired   // likely a pending prompt
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                if gate.claim() { continuation.resume(throwing: RecorderError.permissionRequired) }
             }
-            group.cancelAll()
-            guard let content = try await group.next() else {
-                throw RecorderError.permissionRequired
-            }
-            return content
         }
+    }
+
+    /// True only for ScreenCaptureKit's genuine "user declined" error.
+    private static func isPermissionDenied(_ error: Error) -> Bool {
+        let ns = error as NSError
+        return ns.domain == SCStreamErrorDomain && ns.code == SCStreamError.Code.userDeclined.rawValue
     }
 
     /// Fire-and-forget nudge that makes macOS show the Screen Recording
@@ -201,9 +210,14 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         // missing — no separate preflight needed.
         let content: SCShareableContent
         do {
-            content = try await Self.fetchShareableContent(timeout: 4)
+            content = try await Self.fetchShareableContent(timeout: 10)
+        } catch let error as RecorderError {
+            throw error   // timed out: a permission prompt is most likely pending
         } catch {
-            throw RecorderError.permissionRequired
+            // Surface the real error unless it is a genuine permission decline.
+            throw Self.isPermissionDenied(error)
+                ? RecorderError.permissionRequired
+                : RecorderError.captureUnavailable(error.localizedDescription)
         }
 
         guard let display = content.displays.first(where: { $0.displayID == region.displayID }) else {
@@ -618,5 +632,19 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         if id != IOPMAssertionID(kIOPMNullAssertionID) {
             IOPMAssertionRelease(id)
         }
+    }
+}
+
+/// Lets exactly one of several racing callbacks win.
+private final class OnceGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if claimed { return false }
+        claimed = true
+        return true
     }
 }
