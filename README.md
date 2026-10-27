@@ -45,6 +45,13 @@ build/MacScreenRec.app/Contents/MacOS/MacScreenRec --selftest   # 6 s end-to-end
 swift Scripts/Probe.swift <file.mp4>               # inspect a recording's tracks/duration
 ```
 
+> **Note on permission prompts:** running the binary directly from a terminal
+> attributes the Screen Recording permission prompt to your terminal app
+> (macOS attributes shell-launched processes to the app that spawned them).
+> Launch the app normally (Finder, Dock, or `open`) and the prompt correctly
+> names **Mac Screen Recorder**. These are separate grants — a terminal-granted
+> permission doesn't carry over to the app, and vice versa.
+
 ## Why the "unidentified developer" warning
 
 Release binaries are ad-hoc signed (no Apple Developer ID) because Apple notarization requires a paid developer account. The app is fully open source — build it yourself with `make` if you prefer, or verify the published SHA-256 in the release notes.
