@@ -229,6 +229,78 @@ final class AppController: NSObject {
 
     // MARK: - Self test (development)
 
+    /// The currently selected region, for tests/diagnostics.
+    func regionForTesting() -> RegionSelection? {
+        if case let .armed(sel) = mode { return sel }
+        if case let .recording(sel, _) = mode { return sel }
+        if case let .saved(sel, _) = mode { return sel }
+        return nil
+    }
+
+    /// UI test: exercises the real region-selection flow (overlay, drag,
+    /// dismissal, coordinate conversion) and then records 3 seconds through
+    /// the GUI-produced region. Run with: MacScreenRec --uitest-select
+    func runSelectUITest() {
+        showMainWindow()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { exit(1) }
+            self.selectRegionAction()
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+                guard let self, let screen = NSScreen.main else {
+                    print("UITEST: no main screen")
+                    exit(1)
+                }
+                let ok = RegionSelector.simulateSelection(
+                    from: CGPoint(x: 120, y: 140),
+                    to: CGPoint(x: 600, y: 500),
+                    screen: screen)
+                guard ok else {
+                    print("UITEST: selection overlay was not available")
+                    exit(1)
+                }
+                guard RegionSelector.isSelecting == false else {
+                    print("UITEST: overlay did not dismiss after mouseUp")
+                    exit(1)
+                }
+                guard let sel = self.regionForTesting() else {
+                    print("UITEST: no region selected after drag")
+                    exit(1)
+                }
+                // A drag from (120,140) to (600,500) in the display's top-left
+                // space must produce exactly that rect in ScreenCaptureKit's
+                // top-left sourceRect space.
+                guard abs(sel.rect.minX - 120) < 0.01,
+                      abs(sel.rect.minY - 140) < 0.01,
+                      abs(sel.rect.width - 480) < 0.01,
+                      abs(sel.rect.height - 360) < 0.01 else {
+                    print("UITEST: region mismatch — got \(sel.rect), expected (120, 140, 480, 360)")
+                    exit(1)
+                }
+                print("UITEST: selection OK — overlays dismissed, region=\(sel.rect)")
+
+                Task { @MainActor in
+                    do {
+                        let spec = RegionSpec(
+                            displayID: sel.displayID,
+                            sourceRect: sel.rect,
+                            pixelWidth: Self.evenPixels(sel.rect.width * sel.scale),
+                            pixelHeight: Self.evenPixels(sel.rect.height * sel.scale))
+                        try await self.recorder.start(region: spec, includeSystemAudio: true)
+                        print("UITEST: recording 3 s…")
+                        try await Task.sleep(nanoseconds: 3_000_000_000)
+                        let url = try await self.recorder.stop()
+                        print("UITEST-DONE \(url.path)")
+                        exit(0)
+                    } catch {
+                        print("UITEST-ERROR \(error.localizedDescription)")
+                        exit(1)
+                    }
+                }
+            }
+        }
+    }
+
     /// Headless end-to-end test: records a fixed 480×360 region of the main
     /// display for 6 seconds with system audio and prints the file path.
     /// Run with: MacScreenRec --selftest

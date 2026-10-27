@@ -8,7 +8,7 @@
 # Requires Xcode Command Line Tools. The universal target must run on
 # Apple Silicon (x86_64 cross-compiles from arm64; not the reverse).
 
-VERSION   := 1.0.0
+VERSION   := 1.0.1
 APP_NAME  := MacScreenRec
 BUNDLE_ID := com.robtandy.MacScreenRec
 MIN_MACOS := 13.0

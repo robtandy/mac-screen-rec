@@ -26,12 +26,55 @@ final class RegionSelector: NSObject {
         DispatchQueue.main.async {
             guard Self.active == nil else { return }
             let selector = RegionSelector(completion: completion)
+            Self.active = selector   // strong: keeps the selector alive while
+                                      // its overlay windows are on screen
             selector.show()
-            Self.active = selector
         }
     }
 
-    private static weak var active: RegionSelector?
+    static var isSelecting: Bool { active != nil }
+
+    /// Dev/testing hook: synthesizes a drag on the overlay covering `screen`,
+    /// with points in that display's top-left coordinate space. Returns false
+    /// if no selection is in progress.
+    static func simulateSelection(from start: CGPoint, to end: CGPoint, screen: NSScreen) -> Bool {
+        guard let selector = active,
+              let overlay = selector.overlays.first(where: { $0.frame == screen.frame }),
+              let view = overlay.contentView as? OverlayView else { return false }
+
+        func event(_ type: NSEvent.EventType, at viewPoint: NSPoint) -> NSEvent? {
+            // The content view fills this borderless window, so window
+            // coordinates are view coordinates.
+            return NSEvent.mouseEvent(
+                with: type,
+                location: viewPoint,
+                modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: overlay.windowNumber,
+                context: nil,
+                eventNumber: 0,
+                clickCount: 1,
+                pressure: 1)
+        }
+        func viewPoint(_ p: CGPoint) -> NSPoint {
+            // translate top-left-origin points into the (unflipped) view space
+            NSPoint(x: p.x, y: view.bounds.height - p.y)
+        }
+
+        guard let down = event(.leftMouseDown, at: viewPoint(start)),
+              let drag = event(.leftMouseDragged, at: viewPoint(CGPoint(
+                x: (start.x + end.x) / 2, y: (start.y + end.y) / 2))),
+              let up = event(.leftMouseUp, at: viewPoint(end)) else { return false }
+
+        view.mouseDown(with: down)
+        view.mouseDragged(with: drag)
+        view.mouseUp(with: up)
+        return true
+    }
+
+    /// The in-progress selector. Must be strong: the overlay windows capture
+    /// the selector weakly, so this is the only thing keeping it alive.
+    private static var active: RegionSelector?
 
     private let completion: (RegionSelection?) -> Void
     private var overlays: [OverlayWindow] = []
@@ -57,6 +100,7 @@ final class RegionSelector: NSObject {
     private func finish(rect: CGRect?, screen: NSScreen) {
         guard !finished else { return }
         finished = true
+        Self.active = nil
 
         for overlay in overlays { overlay.close() }
         overlays.removeAll()
@@ -189,6 +233,7 @@ private final class OverlayView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        current = convert(event.locationInWindow, from: nil)   // release point
         let rect = selectionRect
         start = nil
         current = nil

@@ -6,6 +6,7 @@ import AppKit
 let arguments = Set(CommandLine.arguments)
 let smokeTest = arguments.contains("--smoke")
 let selfTest = arguments.contains("--selftest")
+let uiTestSelect = arguments.contains("--uitest-select")
 
 let app = NSApplication.shared
 let controller = AppController()
@@ -17,6 +18,8 @@ app.mainMenu = MainMenu.build(controller: controller)
 
 if selfTest {
     controller.runSelfTest()
+} else if uiTestSelect {
+    controller.runSelectUITest()
 } else {
     controller.showMainWindow()
 }
