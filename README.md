@@ -16,17 +16,23 @@ A tiny Mac app that records **a region of your screen together with system audio
 3. Right-click the app and choose **Open** (releases are unsigned — see below), then click **Open** in the dialog
 4. On first recording, macOS asks for **Screen & System Audio Recording** permission — enable it for Mac Screen Recorder, then click Record again
 
-> **Updating to a new version?** The app is unsigned, so macOS treats each new build as a
-> different app and the permission needs to be granted again: in System Settings →
-> Privacy & Security → Screen & System Audio Recording, remove Mac Screen Recorder
-> (–) and re-add it (+) or approve the new prompt, then relaunch the app.
-> A toggle that already shows “on” may not be enough after an update.
+> **Updating to a new version?** The app is unsigned, so macOS pins the Screen Recording
+> permission to one exact build — a toggle that still shows “on” won't apply to the new
+> version (and toggling it doesn't re-bind it). Run this in Terminal, relaunch the app,
+> and approve the prompt:
+>
+> ```sh
+> tccutil reset ScreenCapture com.robtandy.MacScreenRec
+> ```
 
 ## Use
 
 1. Click **Select Region…** and drag over the part of the screen you want
-2. Click **Record** — a floating bar shows the timer; click **Stop** when done
-3. The MP4 is saved to `~/Movies` (there's a **Reveal in Finder** button)
+2. Click **Record** — a floating bar shows the timer
+3. Stop with the **stop hotkey** (Esc by default, works from any app), the bar's **Stop** button, or ⌘↩
+4. The MP4 is saved to `~/Movies` (there's a **Reveal in Finder** button) and the region frame clears
+
+To change the stop hotkey, click it in the main window and press a new combination (Esc, a function key, or any key with ⌘/⌥/⌃/⇧).
 
 The region frame and floating bar are visible on your screen but are excluded from the recording. System audio = whatever your Mac is playing (music, browser, calls…); the microphone is not recorded. The region must live on a single display.
 

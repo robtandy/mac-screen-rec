@@ -618,12 +618,13 @@ final class AppController: NSObject {
                 to record video and sound.
 
                 Open System Settings → Privacy & Security → Screen & System Audio
-                Recording and enable Mac Screen Recorder.
+                Recording, enable Mac Screen Recorder, then relaunch the app.
 
-                If it already appears enabled, switch it off and back on — macOS
-                needs the toggle refreshed after each app update (the app is
-                unsigned, so each new version counts as a new app). Then click
-                Record again.
+                Already enabled but still asked (common after an update)? The app
+                is unsigned, so macOS pins the permission to one exact build. Run
+                this in Terminal, relaunch the app and approve the prompt:
+
+                tccutil reset ScreenCapture com.robtandy.MacScreenRec
                 """
             alert.addButton(withTitle: "Open System Settings")
             alert.addButton(withTitle: "OK")
