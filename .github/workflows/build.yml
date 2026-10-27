@@ -1,0 +1,35 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal app
+        run: make release
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MacScreenRec
+          path: dist/*.zip
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.zip dist/*.txt \
+            --title "MacScreenRec ${GITHUB_REF_NAME}" \
+            --generate-notes --latest
