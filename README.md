@@ -38,7 +38,7 @@ The region frame and floating bar are visible on your screen but are excluded fr
 
 ### Known limitations
 
-- **Silent audio with some Bluetooth outputs** — a few Bluetooth devices (e.g. some wireless headphones) don't expose their audio to macOS' loopback tap, so recordings made while they are the active output are silent. This is a macOS/ScreenCaptureKit limitation; switch to the built-in speakers or a wired/USB output for those recordings.
+- **Bluetooth headphones paired to several devices (multipoint):** if a recording is silent, make sure the Mac is the headphones' active audio source.
 - Videos are 30 fps H.264 with AAC audio.
 
 ## Build from source

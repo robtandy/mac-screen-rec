@@ -29,6 +29,7 @@ final class AppController: NSObject {
     private let statusLabel = NSTextField(labelWithString: "")
     private let revealButton = NSButton(title: "Reveal in Finder", target: nil, action: nil)
     private let openButton = NSButton(title: "Play", target: nil, action: nil)
+    private let privacyButton = NSButton(title: "Open Privacy Settings", target: nil, action: nil)
     private lazy var savedRow = NSStackView(views: [revealButton, openButton])
 
     private var overlays: RecordingOverlays?
@@ -107,8 +108,17 @@ final class AppController: NSObject {
 
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
-        statusLabel.lineBreakMode = .byTruncatingMiddle
-        statusLabel.maximumNumberOfLines = 1
+        statusLabel.lineBreakMode = .byWordWrapping
+        statusLabel.maximumNumberOfLines = 2
+        statusLabel.preferredMaxLayoutWidth = 340
+        statusLabel.alignment = .center
+
+        privacyButton.bezelStyle = .rounded
+        privacyButton.controlSize = .small
+        privacyButton.font = .systemFont(ofSize: 11)
+        privacyButton.target = self
+        privacyButton.action = #selector(openPrivacySettingsAction)
+        privacyButton.isHidden = true
 
         for button in [revealButton, openButton] {
             button.bezelStyle = .rounded
@@ -139,6 +149,7 @@ final class AppController: NSObject {
             hotkeyRow,
             recordButton,
             statusLabel,
+            privacyButton,
             savedRow,
         ])
         stack.orientation = .vertical
@@ -534,7 +545,13 @@ final class AppController: NSObject {
 
     private func setMode(_ newMode: Mode) {
         mode = newMode
+        statusLabel.textColor = .secondaryLabelColor
+        privacyButton.isHidden = true
         render()
+    }
+
+    @objc private func openPrivacySettingsAction() {
+        openScreenRecordingSettings()
     }
 
     private func showOverlays(for selection: RegionSelection, recording: Bool) {
@@ -611,30 +628,11 @@ final class AppController: NSObject {
         Self.testLog("APPERROR: \(error.localizedDescription)")
         if let recError = error as? ScreenRecorder.RecorderError,
            case .permissionRequired = recError {
-            let alert = NSAlert()
-            alert.messageText = "Screen Recording permission required"
-            alert.informativeText = """
-                “Mac Screen Recorder” needs Screen & System Audio Recording access
-                to record video and sound.
-
-                Open System Settings → Privacy & Security → Screen & System Audio
-                Recording, enable Mac Screen Recorder, then relaunch the app.
-
-                Already enabled but still asked (common after an update)? The app
-                is unsigned, so macOS pins the permission to one exact build. Run
-                this in Terminal, relaunch the app and approve the prompt:
-
-                tccutil reset ScreenCapture com.robtandy.MacScreenRec
-                """
-            alert.addButton(withTitle: "Open System Settings")
-            alert.addButton(withTitle: "OK")
-            if let w = window, w.isVisible {
-                alert.beginSheetModal(for: w) { [weak self] response in
-                    if response == .alertFirstButtonReturn { self?.openScreenRecordingSettings() }
-                }
-            } else {
-                if alert.runModal() == .alertFirstButtonReturn { openScreenRecordingSettings() }
-            }
+            // macOS shows its own permission prompt; don't stack a second
+            // dialog on top of it — show inline guidance instead.
+            statusLabel.stringValue = "Allow Mac Screen Recorder in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen the app."
+            statusLabel.textColor = .systemRed
+            privacyButton.isHidden = false
             return
         }
 

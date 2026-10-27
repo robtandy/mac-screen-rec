@@ -90,6 +90,32 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private var powerAssertion: IOPMAssertionID = IOPMAssertionID(kIOPMNullAssertionID)
 
+    /// How captured frames feed the writer. `copy` (default) copies each
+    /// ScreenCaptureKit frame into our own pool so SCK's buffers are released
+    /// immediately; `retain` keeps SCK's buffer; `direct` appends SCK sample
+    /// buffers as-is without pacing. Override: MAC_SCREEN_REC_VIDEO_STRATEGY
+    /// env var or the `videoStrategy` user default.
+    enum VideoStrategy: String { case copy, retain, direct }
+    private let videoStrategy: VideoStrategy = {
+        if let v = ProcessInfo.processInfo.environment["MAC_SCREEN_REC_VIDEO_STRATEGY"], let s = VideoStrategy(rawValue: v) { return s }
+        if let v = UserDefaults.standard.string(forKey: "videoStrategy"), let s = VideoStrategy(rawValue: v) { return s }
+        return .copy
+    }()
+    private let debug = ProcessInfo.processInfo.environment["MAC_SCREEN_REC_DEBUG"] == "1"
+    private var copyPool: CVPixelBufferPool?
+    private var lastDirectVideoPTS = CMTime.invalid   // videoQueue (direct strategy)
+    private let statsLock = NSLock()
+    private var stats: [String: Int] = [:]
+    private func statsSnapshot() -> [String: Int] {
+        statsLock.lock()
+        defer { statsLock.unlock() }
+        return stats
+    }
+    private func count(_ key: String) {
+        guard debug else { return }
+        statsLock.lock(); stats[key, default: 0] += 1; statsLock.unlock()
+    }
+
     private static let activeFrameInterval: TimeInterval = 1.0 / 30.0
     private static let idleFrameInterval: TimeInterval = 0.2
     private static let idleThresholdTicks = 45   // ~1.5 s without changes
@@ -202,6 +228,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         hasNewContent = false
         ticksSinceContent = 0
         lastAppendedVideoPTS = .invalid
+        lastDirectVideoPTS = .invalid
+        statsLock.lock(); stats = [:]; statsLock.unlock()
     }
 
     private func beginCapture(region: RegionSpec, includeSystemAudio: Bool, showsCursor: Bool) async throws {
@@ -275,6 +303,12 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             kCVPixelBufferHeightKey as String: region.pixelHeight,
         ]
         let ad = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: vi, sourcePixelBufferAttributes: pixelAttributes)
+        var pool: CVPixelBufferPool?
+        var poolAttributes = pixelAttributes
+        poolAttributes[kCVPixelBufferIOSurfacePropertiesKey as String] = [String: Any]()
+        CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, poolAttributes as CFDictionary, &pool)
+        copyPool = pool
+        if debug { AppController.testLog("DEBUG: video strategy = \(videoStrategy.rawValue)") }
 
         var ai: AVAssetWriterInput?
         if includeSystemAudio {
@@ -334,6 +368,11 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         videoQueue.sync { }
         audioQueue.sync { }
 
+        if debug {
+            let snapshot = statsSnapshot()
+            AppController.testLog("DEBUG stats: " + snapshot.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
+        }
+
         let prepared = withLock { () -> (writer: AVAssetWriter, url: URL, started: Bool)? in
             guard let w = writer, let url = fileURL else { return nil }
             let started = sessionStarted
@@ -390,6 +429,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         lock.unlock()
         guard active else { return }
 
+        count(type == .screen ? "cb.screen" : (type == .audio ? "cb.audio" : "cb.other"))
         switch type {
         case .screen: adoptVideo(sampleBuffer)
         case .audio: appendAudio(sampleBuffer)
@@ -416,15 +456,67 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         if let status = frameStatus(of: sb), status != .complete { return }
         guard let pb = CMSampleBufferGetImageBuffer(sb) else { return }
 
+        let frame: CVPixelBuffer
+        switch videoStrategy {
+        case .direct:
+            appendVideoDirect(sb)
+            return
+        case .retain:
+            frame = pb
+        case .copy:
+            guard let copied = copyPixelBuffer(pb) else { count("video.copyFailed"); return }
+            frame = copied
+        }
+
         pacingQueue.async { [weak self] in
             guard let self else { return }
             if self.latestFrame == nil {
                 self.isPacing = true
                 self.schedulePacingTick(after: ScreenRecorder.activeFrameInterval)
             }
-            self.latestFrame = pb
+            self.latestFrame = frame
             self.hasNewContent = true
         }
+    }
+
+    /// Copies a ScreenCaptureKit frame into our own pool so SCK's buffer can
+    /// be returned to it immediately.
+    private func copyPixelBuffer(_ src: CVPixelBuffer) -> CVPixelBuffer? {
+        guard let pool = copyPool else { return nil }
+        var out: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &out) == kCVReturnSuccess,
+              let dst = out else { return nil }
+        CVPixelBufferLockBaseAddress(src, .readOnly)
+        CVPixelBufferLockBaseAddress(dst, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(dst, [])
+            CVPixelBufferUnlockBaseAddress(src, .readOnly)
+        }
+        let planes = CVPixelBufferGetPlaneCount(src)
+        guard planes > 0, planes == CVPixelBufferGetPlaneCount(dst) else { return nil }
+        for plane in 0..<planes {
+            guard let s = CVPixelBufferGetBaseAddressOfPlane(src, plane),
+                  let d = CVPixelBufferGetBaseAddressOfPlane(dst, plane) else { return nil }
+            let srcStride = CVPixelBufferGetBytesPerRowOfPlane(src, plane)
+            let dstStride = CVPixelBufferGetBytesPerRowOfPlane(dst, plane)
+            let rows = min(CVPixelBufferGetHeightOfPlane(src, plane), CVPixelBufferGetHeightOfPlane(dst, plane))
+            let rowBytes = min(srcStride, dstStride)
+            for row in 0..<rows {
+                memcpy(d + row * dstStride, s + row * srcStride, rowBytes)
+            }
+        }
+        return dst
+    }
+
+    /// Pre-pacing behavior: append ScreenCaptureKit sample buffers directly.
+    private func appendVideoDirect(_ sb: CMSampleBuffer) {
+        guard let w = writer, w.status == .writing, let vi = videoInput else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sb)
+        guard pts.isValid, pts.isNumeric, pts.value > 0 else { return }
+        if lastDirectVideoPTS.isValid, CMTimeCompare(pts, lastDirectVideoPTS) <= 0 { return }
+        beginSessionIfNeeded(at: pts)
+        if let s = currentSessionStart(), CMTimeCompare(pts, s) < 0 { return }
+        if vi.isReadyForMoreMediaData, vi.append(sb) { lastDirectVideoPTS = pts }
     }
 
     private func schedulePacingTick(after delay: TimeInterval) {
@@ -492,10 +584,10 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             let pts = CMSampleBufferGetPresentationTimeStamp(sb)
             // Trust the delivered timestamps unless they look unusable (e.g.
             // zero or earlier than an already-started video session).
-            var trusted = pts.isValid && pts.isNumeric && pts.value > 0
-            if let sessionStart = currentSessionStart(), CMTimeCompare(pts, sessionStart) < 0 {
-                trusted = false
-            }
+            // Only unusable timestamps go to the synthetic timeline. A first
+            // buffer slightly before the session start is normal (the video
+            // pacer can start the session first) and is trimmed below.
+            let trusted = pts.isValid && pts.isNumeric && pts.value > 0
             audioTrusted = trusted
             if !trusted {
                 let anchor: CMTime
@@ -515,8 +607,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             // Rebuild timestamps on a synthetic timeline.
             let rate = max(1, CMTimeScale(audioRate))
             let pts = CMTimeAdd(audioSyntheticAnchor, CMTime(value: audioSyntheticSamples, timescale: rate))
-            let dur = CMTime(value: CMTimeValue(numSamples), timescale: rate)
-            guard let retimed = Self.retimed(sb, pts: pts, duration: dur) else { return }
+            guard let retimed = Self.retimed(sb, pts: pts, sampleRate: audioRate) else { return }
             buffer = retimed
         }
 
@@ -527,9 +618,10 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         if lastAudioEnd.isValid, CMTimeCompare(eff, lastAudioEnd) < 0 {
             if CMTimeCompare(CMTimeAdd(eff, dur), lastAudioEnd) <= 0 {
                 audioSyntheticSamples += Int64(numSamples)
+                count("audio.overlapDrop")
                 return   // fully overlapped, drop
             }
-            guard let bumped = Self.retimed(buffer, pts: lastAudioEnd, duration: dur) else { return }
+            guard let bumped = Self.retimed(buffer, pts: lastAudioEnd, sampleRate: audioRate) else { return }
             buffer = bumped
             eff = lastAudioEnd
         }
@@ -539,6 +631,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         // Never append audio that predates the session start.
         if let sessionStart = currentSessionStart(), CMTimeCompare(eff, sessionStart) < 0 {
             audioSyntheticSamples += Int64(numSamples)
+            count("audio.beforeSession")
             return
         }
 
@@ -546,9 +639,13 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             if ai.append(buffer) {
                 lastAudioEnd = CMTimeAdd(eff, dur)
                 audioSyntheticSamples += Int64(numSamples)
+                count("audio.appended")
+            } else {
+                count("audio.appendFailed")
             }
         } else {
             audioSyntheticSamples += Int64(numSamples)
+            count("audio.notReady")
         }
     }
 
@@ -580,14 +677,16 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func duration(of sb: CMSampleBuffer) -> CMTime {
-        let d = CMSampleBufferGetDuration(sb)
-        if d.isValid, d.value > 0 { return d }
         let rate = max(1, CMTimeScale(audioRate))
         return CMTime(value: CMTimeValue(CMSampleBufferGetNumSamples(sb)), timescale: rate)
     }
 
-    private static func retimed(_ sb: CMSampleBuffer, pts: CMTime, duration: CMTime) -> CMSampleBuffer? {
-        var timing = [CMSampleTimingInfo(duration: duration, presentationTimeStamp: pts, decodeTimeStamp: .invalid)]
+    /// Copies an audio buffer with a new start time. CoreMedia applies a single
+    /// timing entry to EVERY sample, so the duration must be per sample
+    /// (1 / sample rate), not the buffer's total duration.
+    private static func retimed(_ sb: CMSampleBuffer, pts: CMTime, sampleRate: Double) -> CMSampleBuffer? {
+        let perSample = CMTime(value: 1, timescale: max(1, CMTimeScale(sampleRate)))
+        var timing = [CMSampleTimingInfo(duration: perSample, presentationTimeStamp: pts, decodeTimeStamp: .invalid)]
         var out: CMSampleBuffer?
         let err = CMSampleBufferCreateCopyWithNewTiming(
             allocator: kCFAllocatorDefault,
