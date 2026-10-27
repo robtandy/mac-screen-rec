@@ -579,14 +579,31 @@ final class AppController: NSObject {
 
     // MARK: - Errors
 
+    /// Presents alerts as a sheet on the main window instead of running a
+    /// modal session — a modal alert blocks app termination, which breaks the
+    /// "quit and reopen" flow macOS uses after permission changes.
+    private func presentAlert(_ alert: NSAlert) {
+        if let w = window, w.isVisible {
+            alert.beginSheetModal(for: w, completionHandler: nil)
+        } else {
+            alert.runModal()
+        }
+    }
+
     private func recordingEndedUnexpectedly(_ message: String) {
         guard isRecording else { return }
         let alert = NSAlert()
         alert.messageText = "Recording ended unexpectedly"
         alert.informativeText = "\(message)\n\nThe portion captured so far was saved to your Movies folder."
         stopRecording()   // finalizes whatever was captured
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-            alert.runModal()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            self?.presentAlert(alert)
+        }
+    }
+
+    private func openScreenRecordingSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
         }
     }
 
@@ -610,9 +627,12 @@ final class AppController: NSObject {
                 """
             alert.addButton(withTitle: "Open System Settings")
             alert.addButton(withTitle: "OK")
-            if alert.runModal() == .alertFirstButtonReturn,
-               let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
-                NSWorkspace.shared.open(url)
+            if let w = window, w.isVisible {
+                alert.beginSheetModal(for: w) { [weak self] response in
+                    if response == .alertFirstButtonReturn { self?.openScreenRecordingSettings() }
+                }
+            } else {
+                if alert.runModal() == .alertFirstButtonReturn { openScreenRecordingSettings() }
             }
             return
         }
@@ -620,7 +640,7 @@ final class AppController: NSObject {
         let alert = NSAlert()
         alert.messageText = "Recording failed"
         alert.informativeText = error.localizedDescription
-        alert.runModal()
+        presentAlert(alert)
     }
 
     private static func evenPixels(_ value: CGFloat) -> Int {
