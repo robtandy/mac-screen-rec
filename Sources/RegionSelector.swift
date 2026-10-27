@@ -34,6 +34,11 @@ final class RegionSelector: NSObject {
 
     static var isSelecting: Bool { active != nil }
 
+    /// Dev/testing: frames of the current overlay windows.
+    static var debugOverlayFrames: [NSRect] {
+        active?.overlays.map(\.frame) ?? []
+    }
+
     /// Dev/testing hook: synthesizes a drag on the overlay covering `screen`,
     /// with points in that display's top-left coordinate space. Returns false
     /// if no selection is in progress.

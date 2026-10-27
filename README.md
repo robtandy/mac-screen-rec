@@ -16,6 +16,12 @@ A tiny Mac app that records **a region of your screen together with system audio
 3. Right-click the app and choose **Open** (releases are unsigned — see below), then click **Open** in the dialog
 4. On first recording, macOS asks for **Screen & System Audio Recording** permission — enable it for Mac Screen Recorder, then click Record again
 
+> **Updating to a new version?** The app is unsigned, so macOS treats each new build as a
+> different app and the permission needs to be granted again: in System Settings →
+> Privacy & Security → Screen & System Audio Recording, remove Mac Screen Recorder
+> (–) and re-add it (+) or approve the new prompt, then relaunch the app.
+> A toggle that already shows “on” may not be enough after an update.
+
 ## Use
 
 1. Click **Select Region…** and drag over the part of the screen you want

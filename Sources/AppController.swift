@@ -10,7 +10,7 @@ final class AppController: NSObject {
         case selecting
         case armed(RegionSelection)
         case recording(RegionSelection, startedAt: Date)
-        case saved(RegionSelection, url: URL)
+        case saved(URL)
     }
 
     private var mode: Mode = .idle
@@ -23,6 +23,8 @@ final class AppController: NSObject {
     private let regionLabel = NSTextField(labelWithString: "No region selected")
     private let selectButton = NSButton(title: "Select Region…", target: nil, action: nil)
     private let audioCheckbox = NSButton(checkboxWithTitle: "Include system audio", target: nil, action: nil)
+    private let hotkeyLabel = NSTextField(labelWithString: "Stop hotkey:")
+    private let hotkeyButton = NSButton(title: "esc", target: nil, action: nil)
     private let recordButton = NSButton(title: "Record", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
     private let revealButton = NSButton(title: "Reveal in Finder", target: nil, action: nil)
@@ -31,11 +33,26 @@ final class AppController: NSObject {
 
     private var overlays: RecordingOverlays?
     private let recorder = ScreenRecorder()
+    private let hotkeyCenter = HotkeyCenter()
     private var elapsedTimer: Timer?
     private var lastSavedURL: URL?
+    private var stopInFlight = false
+
+    // Stop-hotkey configuration (persisted in UserDefaults).
+    private var stopHotkeyCode: UInt32 = HotkeyCenter.defaultKeyCode
+    private var stopHotkeyModifiers: UInt32 = HotkeyCenter.defaultModifiers
+    private var capturingHotkey = false
+    private var captureMonitor: Any?
+
+    private enum DefaultsKeys {
+        static let keyCode = "stopHotkeyCode"
+        static let modifiers = "stopHotkeyModifiers"
+    }
 
     override init() {
         super.init()
+        loadHotkey()
+        hotkeyCenter.onTrigger = { [weak self] in self?.stopRecording() }
         recorder.onStreamError = { [weak self] message in
             self?.recordingEndedUnexpectedly(message)
         }
@@ -49,7 +66,7 @@ final class AppController: NSObject {
             return
         }
 
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 330),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 360),
                          styleMask: [.titled, .closable, .miniaturizable],
                          backing: .buffered,
                          defer: false)
@@ -71,6 +88,15 @@ final class AppController: NSObject {
         selectButton.action = #selector(selectRegionAction)
 
         audioCheckbox.state = .on
+
+        hotkeyLabel.font = .systemFont(ofSize: 12)
+        hotkeyLabel.textColor = .secondaryLabelColor
+        hotkeyButton.bezelStyle = .rounded
+        hotkeyButton.controlSize = .small
+        hotkeyButton.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        hotkeyButton.target = self
+        hotkeyButton.action = #selector(hotkeyButtonClicked)
+        updateHotkeyButtonTitle()
 
         recordButton.bezelStyle = .rounded
         recordButton.font = .systemFont(ofSize: 13, weight: .semibold)
@@ -101,18 +127,23 @@ final class AppController: NSObject {
         regionRow.orientation = .horizontal
         regionRow.spacing = 8
 
+        let hotkeyRow = NSStackView(views: [hotkeyLabel, hotkeyButton])
+        hotkeyRow.orientation = .horizontal
+        hotkeyRow.spacing = 8
+
         let stack = NSStackView(views: [
             titleLabel,
             subtitleLabel,
             regionRow,
             audioCheckbox,
+            hotkeyRow,
             recordButton,
             statusLabel,
             savedRow,
         ])
         stack.orientation = .vertical
         stack.alignment = .centerX
-        stack.spacing = 12
+        stack.spacing = 11
         stack.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
@@ -138,10 +169,10 @@ final class AppController: NSObject {
 
     @objc func selectRegionAction() {
         guard !isRecording else { return }
+        cancelHotkeyCapture()
 
         var previous: RegionSelection?
         if case let .armed(sel) = mode { previous = sel }
-        if case let .saved(sel, _) = mode { previous = sel }
 
         setMode(.selecting)
         overlays?.dismiss()
@@ -167,6 +198,7 @@ final class AppController: NSObject {
             return
         }
         guard case let .armed(selection) = mode else { return }
+        cancelHotkeyCapture()
 
         let scale = selection.scale
         let spec = RegionSpec(
@@ -180,6 +212,9 @@ final class AppController: NSObject {
         Task { @MainActor in
             do {
                 try await recorder.start(region: spec, includeSystemAudio: includeAudio)
+                if !hotkeyCenter.register(keyCode: stopHotkeyCode, carbonModifiers: stopHotkeyModifiers) {
+                    statusLabel.stringValue = "Stop hotkey unavailable — use the Stop button"
+                }
                 self.setMode(.recording(selection, startedAt: Date()))
                 self.overlays?.update(recording: true)
                 self.startTimer()
@@ -191,16 +226,23 @@ final class AppController: NSObject {
     }
 
     func stopRecording() {
-        guard case let .recording(selection, _) = mode else { return }
+        guard !stopInFlight, case let .recording(selection, _) = mode else { return }
+        stopInFlight = true
         stopTimer()
+        hotkeyCenter.unregister()
+        cancelHotkeyCapture()
 
         Task { @MainActor in
+            defer { stopInFlight = false }
             do {
                 let url = try await recorder.stop()
                 self.lastSavedURL = url
-                self.setMode(.saved(selection, url: url))
-                self.overlays?.update(recording: false)
+                // Recording finished: clear the on-screen region furniture.
+                self.overlays?.dismiss()
+                self.overlays = nil
+                self.setMode(.saved(url))
             } catch {
+                // Keep the region armed so the user can retry.
                 self.setMode(.armed(selection))
                 self.overlays?.update(recording: false)
                 self.presentError(error)
@@ -227,77 +269,108 @@ final class AppController: NSObject {
         }
     }
 
-    // MARK: - Self test (development)
+    // MARK: - Stop hotkey configuration
+
+    @objc private func hotkeyButtonClicked() {
+        capturingHotkey ? cancelHotkeyCapture() : beginHotkeyCapture()
+    }
+
+    private func beginHotkeyCapture() {
+        capturingHotkey = true
+        hotkeyButton.title = "Press keys…"
+        captureMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            // Wait for a real key; bare modifier presses don't count.
+            if Self.isModifierKeyCode(event.keyCode) { return nil }
+
+            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let carbonMods = HotkeyCenter.carbonFlags(from: mods)
+            guard HotkeyCenter.isValidStopHotkey(keyCode: UInt32(event.keyCode),
+                                                 carbonModifiers: carbonMods) else {
+                return nil   // invalid combo — keep listening
+            }
+            self.setStopHotkey(keyCode: UInt32(event.keyCode), modifiers: carbonMods)
+            self.endHotkeyCapture()
+            return nil
+        }
+    }
+
+    private func endHotkeyCapture() {
+        if let monitor = captureMonitor {
+            NSEvent.removeMonitor(monitor)
+            captureMonitor = nil
+        }
+        capturingHotkey = false
+        updateHotkeyButtonTitle()
+    }
+
+    func cancelHotkeyCapture() {
+        guard capturingHotkey else { return }
+        endHotkeyCapture()
+    }
+
+    private func setStopHotkey(keyCode: UInt32, modifiers: UInt32) {
+        stopHotkeyCode = keyCode
+        stopHotkeyModifiers = modifiers
+        UserDefaults.standard.set(Int(keyCode), forKey: DefaultsKeys.keyCode)
+        UserDefaults.standard.set(Int(modifiers), forKey: DefaultsKeys.modifiers)
+        if isRecording {
+            // Apply the new hotkey to the active recording.
+            hotkeyCenter.register(keyCode: keyCode, carbonModifiers: modifiers)
+        }
+    }
+
+    private func loadHotkey() {
+        let defaults = UserDefaults.standard
+        if let code = defaults.object(forKey: DefaultsKeys.keyCode) as? Int,
+           let mods = defaults.object(forKey: DefaultsKeys.modifiers) as? Int,
+           code > 0, code <= 127,
+           HotkeyCenter.isValidStopHotkey(keyCode: UInt32(code), carbonModifiers: UInt32(mods)) {
+            stopHotkeyCode = UInt32(code)
+            stopHotkeyModifiers = UInt32(mods)
+        }
+    }
+
+    private func updateHotkeyButtonTitle() {
+        hotkeyButton.title = HotkeyCenter.displayName(keyCode: stopHotkeyCode,
+                                                      carbonModifiers: stopHotkeyModifiers)
+    }
+
+    private static func isModifierKeyCode(_ keyCode: UInt16) -> Bool {
+        [54, 55, 56, 57, 58, 59, 60, 61, 62, 63].contains(keyCode)
+    }
+
+    // MARK: - Self tests (development)
+
+    /// Prints test output and mirrors it to $MAC_SCREEN_REC_TEST_LOG when set,
+    /// so tests launched via `open` can report without a console.
+    private static let testLogHandle: FileHandle? = {
+        guard let path = ProcessInfo.processInfo.environment["MAC_SCREEN_REC_TEST_LOG"] else { return nil }
+        FileManager.default.createFile(atPath: path, contents: nil)
+        return FileHandle(forWritingAtPath: path)
+    }()
+
+    static func testLog(_ line: String) {
+        print(line)
+        if let handle = testLogHandle {
+            handle.write((line + "\n").data(using: .utf8)!)
+        }
+    }
 
     /// The currently selected region, for tests/diagnostics.
     func regionForTesting() -> RegionSelection? {
         if case let .armed(sel) = mode { return sel }
         if case let .recording(sel, _) = mode { return sel }
-        if case let .saved(sel, _) = mode { return sel }
         return nil
     }
 
-    /// UI test: exercises the real region-selection flow (overlay, drag,
-    /// dismissal, coordinate conversion) and then records 3 seconds through
-    /// the GUI-produced region. Run with: MacScreenRec --uitest-select
-    func runSelectUITest() {
-        showMainWindow()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self else { exit(1) }
-            self.selectRegionAction()
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
-                guard let self, let screen = NSScreen.main else {
-                    print("UITEST: no main screen")
-                    exit(1)
-                }
-                let ok = RegionSelector.simulateSelection(
-                    from: CGPoint(x: 120, y: 140),
-                    to: CGPoint(x: 600, y: 500),
-                    screen: screen)
-                guard ok else {
-                    print("UITEST: selection overlay was not available")
-                    exit(1)
-                }
-                guard RegionSelector.isSelecting == false else {
-                    print("UITEST: overlay did not dismiss after mouseUp")
-                    exit(1)
-                }
-                guard let sel = self.regionForTesting() else {
-                    print("UITEST: no region selected after drag")
-                    exit(1)
-                }
-                // A drag from (120,140) to (600,500) in the display's top-left
-                // space must produce exactly that rect in ScreenCaptureKit's
-                // top-left sourceRect space.
-                guard abs(sel.rect.minX - 120) < 0.01,
-                      abs(sel.rect.minY - 140) < 0.01,
-                      abs(sel.rect.width - 480) < 0.01,
-                      abs(sel.rect.height - 360) < 0.01 else {
-                    print("UITEST: region mismatch — got \(sel.rect), expected (120, 140, 480, 360)")
-                    exit(1)
-                }
-                print("UITEST: selection OK — overlays dismissed, region=\(sel.rect)")
-
-                Task { @MainActor in
-                    do {
-                        let spec = RegionSpec(
-                            displayID: sel.displayID,
-                            sourceRect: sel.rect,
-                            pixelWidth: Self.evenPixels(sel.rect.width * sel.scale),
-                            pixelHeight: Self.evenPixels(sel.rect.height * sel.scale))
-                        try await self.recorder.start(region: spec, includeSystemAudio: true)
-                        print("UITEST: recording 3 s…")
-                        try await Task.sleep(nanoseconds: 3_000_000_000)
-                        let url = try await self.recorder.stop()
-                        print("UITEST-DONE \(url.path)")
-                        exit(0)
-                    } catch {
-                        print("UITEST-ERROR \(error.localizedDescription)")
-                        exit(1)
-                    }
-                }
-            }
+    func stateForTesting() -> String {
+        switch mode {
+        case .idle: return "idle"
+        case .selecting: return "selecting"
+        case .armed: return "armed"
+        case .recording: return "recording"
+        case .saved(let url): return "saved:\(url.lastPathComponent)"
         }
     }
 
@@ -306,16 +379,16 @@ final class AppController: NSObject {
     /// Run with: MacScreenRec --selftest
     func runSelfTest() {
         Task { @MainActor in
-            print("SELFTEST: waiting for Screen Recording permission…")
+            Self.testLog("SELFTEST: waiting for Screen Recording permission…")
             let granted = await ScreenRecorder.requestPermission(timeout: 90)
             guard granted else {
-                print("SELFTEST: DENIED — grant Screen Recording permission and retry")
+                Self.testLog("SELFTEST: DENIED — grant Screen Recording permission and retry")
                 exit(1)
             }
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
                 guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) else {
-                    print("SELFTEST: main display not found")
+                    Self.testLog("SELFTEST: main display not found")
                     exit(1)
                 }
                 let scale = NSScreen.main?.backingScaleFactor ?? 2
@@ -331,16 +404,111 @@ final class AppController: NSObject {
                     pixelHeight: Self.evenPixels(rect.height * scale))
 
                 try await recorder.start(region: spec, includeSystemAudio: true)
-                print("SELFTEST: recording 6 s…")
+                Self.testLog("SELFTEST: recording 6 s…")
                 try await Task.sleep(nanoseconds: 6_000_000_000)
                 let url = try await recorder.stop()
-                print("SELFTEST-DONE \(url.path)")
+                Self.testLog("SELFTEST-DONE \(url.path)")
                 exit(0)
             } catch {
-                print("SELFTEST-ERROR \(error.localizedDescription)")
+                Self.testLog("SELFTEST-ERROR \(error.localizedDescription)")
                 exit(1)
             }
         }
+    }
+
+    /// UI test: exercises the real region-selection flow (overlay, drag,
+    /// dismissal, coordinate conversion), then records through the actual
+    /// GUI start path and stops via the hotkey trigger. Run with:
+    /// MacScreenRec --uitest-select
+    func runSelectUITest() {
+        showMainWindow()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { exit(1) }
+            self.selectRegionAction()
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+                guard let self, let screen = NSScreen.main else {
+                    Self.testLog("UITEST: no main screen")
+                    exit(1)
+                }
+                Self.testLog("UITEST: main=\(screen.frame) selecting=\(RegionSelector.isSelecting) overlayFrames=\(RegionSelector.debugOverlayFrames)")
+                guard RegionSelector.simulateSelection(
+                    from: CGPoint(x: 120, y: 140),
+                    to: CGPoint(x: 600, y: 500),
+                    screen: screen) else {
+                    Self.testLog("UITEST: selection overlay was not available")
+                    exit(1)
+                }
+                guard RegionSelector.isSelecting == false else {
+                    Self.testLog("UITEST: overlay did not dismiss after mouseUp")
+                    exit(1)
+                }
+                guard let sel = self.regionForTesting() else {
+                    Self.testLog("UITEST: no region selected after drag")
+                    exit(1)
+                }
+                // A drag from (120,140) to (600,500) in the display's top-left
+                // space must produce exactly that rect in ScreenCaptureKit's
+                // top-left sourceRect space.
+                guard abs(sel.rect.minX - 120) < 0.01,
+                      abs(sel.rect.minY - 140) < 0.01,
+                      abs(sel.rect.width - 480) < 0.01,
+                      abs(sel.rect.height - 360) < 0.01 else {
+                    Self.testLog("UITEST: region mismatch — got \(sel.rect), expected (120, 140, 480, 360)")
+                    exit(1)
+                }
+                Self.testLog("UITEST: selection OK — region=\(sel.rect)")
+
+                // Wait for Screen Recording permission (a system prompt may
+                // appear — grant it for this app), then record for real.
+                Task { @MainActor in
+                    Self.testLog("UITEST: waiting for Screen Recording permission — if it stalls, toggle Mac Screen Recorder OFF then ON in System Settings > Privacy & Security > Screen and System Audio Recording")
+                    let wait = Double(ProcessInfo.processInfo.environment["MAC_SCREEN_REC_PERM_TIMEOUT"] ?? "") ?? 150
+                    guard await ScreenRecorder.requestPermission(timeout: wait) else {
+                        Self.testLog("UITEST: permission denied")
+                        exit(1)
+                    }
+                    self.toggleRecordingAction()   // real GUI path (registers hotkey)
+
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                        guard let self else { exit(1) }
+                        guard self.isRecording else {
+                            Self.testLog("UITEST: recording did not start — state=\(self.stateForTesting())")
+                            exit(1)
+                        }
+                        Self.testLog("UITEST: recording active, stop hotkey registered=\(self.hotkeyCenter.isRegistered)")
+
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                            guard let self else { exit(1) }
+                            // Simulate the stop hotkey firing.
+                            self.hotkeyCenter.onTrigger?()
+
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                                guard let self else { exit(1) }
+                                let state = self.stateForTesting()
+                                Self.testLog("UITEST: state after hotkey stop = \(state)")
+                                guard state.hasPrefix("saved:") else {
+                                    Self.testLog("UITEST: hotkey did not stop the recording")
+                                    exit(1)
+                                }
+                                guard self.overlays == nil else {
+                                    Self.testLog("UITEST: region overlays were not dismissed after stop")
+                                    exit(1)
+                                }
+                                Self.testLog("UITEST-DONE")
+                                exit(0)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static func parseRegionSpec(_ s: String) -> CGRect? {
+        let parts = s.split(separator: ",").compactMap { Double($0) }
+        guard parts.count == 4 else { return nil }
+        return CGRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3])
     }
 
     // MARK: - Timer
@@ -387,6 +555,7 @@ final class AppController: NSObject {
             statusLabel.stringValue = ""
         case .selecting:
             recordButton.isEnabled = false
+            recordButton.title = "Record"
             savedRow.isHidden = true
         case .armed(let sel):
             regionLabel.stringValue = "\(Int(sel.rect.width)) × \(Int(sel.rect.height)) pt — \(sel.screen.localizedName)"
@@ -398,12 +567,12 @@ final class AppController: NSObject {
             recordButton.isEnabled = true
             recordButton.title = "Stop  00:00"
             savedRow.isHidden = true
-        case .saved(let sel, let url):
-            regionLabel.stringValue = "\(Int(sel.rect.width)) × \(Int(sel.rect.height)) pt — \(sel.screen.localizedName)"
-            recordButton.isEnabled = true
-            recordButton.title = "Record again"
+        case .saved(let url):
+            regionLabel.stringValue = "No region selected"
+            recordButton.isEnabled = false
+            recordButton.title = "Record"
             savedRow.isHidden = false
-            statusLabel.stringValue = url.lastPathComponent
+            statusLabel.stringValue = "Saved \(url.lastPathComponent)"
             statusLabel.toolTip = url.path
         }
     }
@@ -412,33 +581,32 @@ final class AppController: NSObject {
 
     private func recordingEndedUnexpectedly(_ message: String) {
         guard isRecording else { return }
-        stopTimer()
-
-        var previous: RegionSelection?
-        if case let .recording(sel, _) = mode { previous = sel }
-        if let sel = previous {
-            setMode(.armed(sel))
-            overlays?.update(recording: false)
-        }
-
         let alert = NSAlert()
         alert.messageText = "Recording ended unexpectedly"
-        alert.informativeText = message
-        alert.runModal()
+        alert.informativeText = "\(message)\n\nThe portion captured so far was saved to your Movies folder."
+        stopRecording()   // finalizes whatever was captured
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            alert.runModal()
+        }
     }
 
     private func presentError(_ error: Error) {
+        Self.testLog("APPERROR: \(error.localizedDescription)")
         if let recError = error as? ScreenRecorder.RecorderError,
            case .permissionRequired = recError {
             let alert = NSAlert()
             alert.messageText = "Screen Recording permission required"
             alert.informativeText = """
-                “Mac Screen Recorder” needs Screen Recording access to capture \
-                video and system audio.
+                “Mac Screen Recorder” needs Screen & System Audio Recording access
+                to record video and sound.
 
-                Open System Settings → Privacy & Security → Screen & System Audio \
-                Recording (on some versions: Screen Recording), enable it for this \
-                app, then click Record again.
+                Open System Settings → Privacy & Security → Screen & System Audio
+                Recording and enable Mac Screen Recorder.
+
+                If it already appears enabled, switch it off and back on — macOS
+                needs the toggle refreshed after each app update (the app is
+                unsigned, so each new version counts as a new app). Then click
+                Record again.
                 """
             alert.addButton(withTitle: "Open System Settings")
             alert.addButton(withTitle: "OK")
@@ -453,12 +621,6 @@ final class AppController: NSObject {
         alert.messageText = "Recording failed"
         alert.informativeText = error.localizedDescription
         alert.runModal()
-    }
-
-    private static func parseRegionSpec(_ s: String) -> CGRect? {
-        let parts = s.split(separator: ",").compactMap { Double($0) }
-        guard parts.count == 4 else { return nil }
-        return CGRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3])
     }
 
     private static func evenPixels(_ value: CGFloat) -> Int {

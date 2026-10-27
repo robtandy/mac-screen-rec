@@ -104,20 +104,58 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - Permission
 
     static func hasPermission() -> Bool {
+        // Quiet check — never triggers a prompt.
         CGPreflightScreenCaptureAccess()
     }
 
-    /// Prompts once and then waits up to `timeout` seconds for the user to
-    /// grant Screen Recording permission. Returns true once granted.
+    /// The real permission check: requesting shareable content is exactly
+    /// what ScreenCaptureKit needs, so it can't disagree with System Settings
+    /// the way CGPreflightScreenCaptureAccess sometimes does.
+    private static func fetchShareableContent(timeout: TimeInterval) async throws -> SCShareableContent {
+        try await withThrowingTaskGroup(of: SCShareableContent.self) { group in
+            group.addTask {
+                try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw RecorderError.permissionRequired   // likely a pending prompt
+            }
+            group.cancelAll()
+            guard let content = try await group.next() else {
+                throw RecorderError.permissionRequired
+            }
+            return content
+        }
+    }
+
+    /// Fire-and-forget nudge that makes macOS show the Screen Recording
+    /// permission prompt for this app. The SCK content request can block
+    /// waiting on the user, so it runs detached — the caller never waits.
+    static func triggerPermissionPrompt() {
+        Task.detached {
+            _ = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        }
+    }
+
+    /// Shows at most one prompt, then waits quietly (polling the non-prompting
+    /// preflight API only) for the user to grant permission in System Settings.
+    /// A successful shareable-content fetch (the real check) short-circuits
+    /// the wait, because CGPreflightScreenCaptureAccess can report false even
+    /// for granted apps on newer macOS versions.
     static func requestPermission(timeout: TimeInterval) async -> Bool {
-        if CGPreflightScreenCaptureAccess() { return true }
-        CGRequestScreenCaptureAccess()
+        if (try? await fetchShareableContent(timeout: 4)) != nil { return true }
+        if hasPermission() { return true }
+        triggerPermissionPrompt()
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            if CGPreflightScreenCaptureAccess() { return true }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            if hasPermission() { return true }
+            // Re-test the real thing occasionally, but rarely enough that it
+            // can never spam prompts (a fetch may prompt when access is
+            // undetermined).
+            if (try? await fetchShareableContent(timeout: 2)) != nil { return true }
         }
-        return CGPreflightScreenCaptureAccess()
+        return hasPermission()
     }
 
     // MARK: - Start / stop
@@ -158,15 +196,12 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func beginCapture(region: RegionSpec, includeSystemAudio: Bool, showsCursor: Bool) async throws {
-        // Screen Recording permission covers both video and system audio.
-        guard Self.hasPermission() else {
-            CGRequestScreenCaptureAccess()   // triggers the system prompt
-            throw RecorderError.permissionRequired
-        }
-
+        // The shareable-content request is the permission check: it triggers
+        // the system prompt on first use and fails cleanly when access is
+        // missing — no separate preflight needed.
         let content: SCShareableContent
         do {
-            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            content = try await Self.fetchShareableContent(timeout: 4)
         } catch {
             throw RecorderError.permissionRequired
         }
